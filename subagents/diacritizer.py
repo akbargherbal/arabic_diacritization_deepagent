@@ -27,11 +27,14 @@ Rules:
   slightly bends standard grammar to fit the meter is acceptable and often
   correct for classical verse. Do not avoid a metrically-correct fix purely
   because it looks grammatically unusual.
-- Known pyarud quirk: words ending in tanwin fath on alif maqsura (e.g.
-  أَسًى) are prone to a scanning bug upstream. If the correction_report
-  references such a word, consider whether the normalized workaround form
-  (e.g. أَسَنْ) is what's actually being requested before treating it as a
-  real metrical error.
+- You must never change the underlying letters (الحروف) of a word to fit
+  the meter — only its diacritic marks. If the correction_report suggests
+  the letters themselves need to change (not just a vowel), that is not
+  something you can fix; leave the word as given and note it, rather than
+  substituting a different word. A committed verse's letters, stripped of
+  diacritics, are checked against the original input and must match
+  exactly — any letter-level change will be rejected regardless of how it
+  scores.
 
 Output: for each broken verse_id, return the corrected sadr/ajuz diacritized
 text. Do not include commentary in the output — text only, per verse_id.

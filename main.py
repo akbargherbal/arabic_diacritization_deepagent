@@ -30,6 +30,7 @@ from tools.prosody_tools import (
 from tools.dataset_tools import commit_verse_tool, log_unresolved_tool
 from tools.sanitization_tools import sanitize_output_tool
 from tools.reconciliation_tools import reconcile_case_ending_tool
+from tools.tracing import trace_run
 from subagents.diacritizer import DIACRITIZER_SUBAGENT
 from subagents.irab_checker_agent import IRAB_SUBAGENT
 from subagents.naturalness_critic import NATURALNESS_CRITIC_SUBAGENT
@@ -277,28 +278,42 @@ if __name__ == "__main__":
         except Exception:
             existing_state = None
 
-        try:
-            if existing_state and existing_state.next:
-                # A previous run was interrupted (e.g. Ctrl+C) partway
-                # through this exact thread_id, with a pending next step.
-                # Passing None as input resumes from the last completed
-                # checkpoint instead of re-sending the original message and
-                # starting the batch over.
+        # trace_run() opens a fresh, unique trace_id for THIS invoke attempt
+        # (deliberately NOT the same thing as the LangGraph thread_id above,
+        # which stays stable across resumes on purpose — see
+        # tools/tracing.py's module docstring for why). The trace_id lets
+        # you inspect token usage / latency per agent (orchestrator,
+        # diacritizer, irab_checker, naturalness_critic) for this specific
+        # attempt, even if the same thread_id gets resumed multiple times.
+        with trace_run(label=meter, langgraph_thread_id=thread_id) as trace:
+            traced_config = {**run_config, "callbacks": [trace.callback]}
+            print(f"[*] trace_id='{trace.trace_id}' "
+                  f"(inspect with: python -m tools.trace_report --trace {trace.trace_id})")
+
+            try:
+                if existing_state and existing_state.next:
+                    # A previous run was interrupted (e.g. Ctrl+C) partway
+                    # through this exact thread_id, with a pending next step.
+                    # Passing None as input resumes from the last completed
+                    # checkpoint instead of re-sending the original message and
+                    # starting the batch over.
+                    print(
+                        f"[*] Resuming interrupted thread '{thread_id}' "
+                        f"(next step: {existing_state.next})..."
+                    )
+                    response = agent.invoke(None, config=traced_config)
+                else:
+                    response = agent.invoke(
+                        {"messages": [{"role": "user", "content": user_message}]},
+                        config=traced_config,
+                    )
+                print(f"[+] Batch execution complete. Response status: {response}")
+            except Exception as e:
+                print(f"[-] Execution failed for batch under meter '{meter}': {str(e)}")
                 print(
-                    f"[*] Resuming interrupted thread '{thread_id}' "
-                    f"(next step: {existing_state.next})..."
+                    f"    Checkpointed state for this run is saved under "
+                    f"thread_id='{thread_id}' in {CHECKPOINT_DB_PATH}. "
+                    f"Re-running this script will attempt to resume it."
                 )
-                response = agent.invoke(None, config=run_config)
-            else:
-                response = agent.invoke(
-                    {"messages": [{"role": "user", "content": user_message}]},
-                    config=run_config,
-                )
-            print(f"[+] Batch execution complete. Response status: {response}")
-        except Exception as e:
-            print(f"[-] Execution failed for batch under meter '{meter}': {str(e)}")
-            print(
-                f"    Checkpointed state for this run is saved under "
-                f"thread_id='{thread_id}' in {CHECKPOINT_DB_PATH}. "
-                f"Re-running this script will attempt to resume it."
-            )
+            finally:
+                print(f"[*] trace summary: python -m tools.trace_report --trace {trace.trace_id}")

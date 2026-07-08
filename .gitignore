@@ -8,4 +8,4 @@ workspace/*
 !workspace/.gitkeep
 .env
 .db
-
+traces.sqlite*
