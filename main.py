@@ -31,6 +31,7 @@ import json
 import pathlib
 import os
 import sqlite3
+import sys
 
 from deepagents import create_deep_agent, FilesystemPermission
 from deepagents.backends import CompositeBackend, StateBackend, FilesystemBackend
@@ -294,7 +295,10 @@ def build_agent():
             # gate — you explicitly declined that. This only pauses once
             # per batch if the disagreement rate looks anomalous. Delete
             # this block entirely if you'd rather have zero interrupts.
-            "finalize_batch": {"mode": "approve", "condition": "disagreement_rate > 0.25"},
+            "finalize_batch": {
+                "mode": "approve",
+                "condition": "disagreement_rate > 0.25",
+            },
         },
     )
 
@@ -305,137 +309,185 @@ def main() -> None:
     agent, checkpoint_conn, checkpoint_db_path = build_agent()
 
     try:
-        # Define absolute paths
-        input_path = PROJECT_ROOT / "dataset" / "inputs" / "batch_01.jsonl"
+        # Determine the input paths dynamically
+        inputs_dir = PROJECT_ROOT / "dataset" / "inputs"
+        jsonl_files = []
 
-        if not input_path.exists():
-            print(f"[-] Input file not found at {input_path}")
-            print("[*] Please create the input file with your normalized verses first.")
-            return
-
-        # 1. Read input verses
-        raw_verses = []
-        with input_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    raw_verses.append(json.loads(line))
-
-        if not raw_verses:
-            print("[-] No verses found in the input file.")
-            return
-
-        # 2. Group verses by meter to process them in coherent batches
-        batches_by_meter = {}
-        for v in raw_verses:
-            meter = v.get("meter", "taweel")  # default fallback if not specified
-            batches_by_meter.setdefault(meter, []).append(
-                {
-                    "verse_id": v["verse_id"],
-                    "sadr": v["sadr"],
-                    "ajuz": v.get("ajuz", ""),
-                }
-            )
-
-        # 3. Invoke the DeepAgent orchestrator for each batch
-        for meter, verses_batch in batches_by_meter.items():
-            print(
-                f"[*] Processing batch of {len(verses_batch)} verses for meter: '{meter}'..."
-            )
-
-            # The graph's default state schema only recognizes "messages"
-            # (plus "files"/"todos"). Passing raw "input"/"verses"/
-            # "meter_name" top-level keys here silently drops them -- the
-            # model never sees the batch. So the verses + meter are
-            # embedded directly into the user message content as JSON
-            # instead.
-            verses_json = json.dumps(verses_batch, ensure_ascii=False, indent=2)
-            user_message = (
-                f"Diacritize the following batch of verses against the meter "
-                f"'{meter}'.\n\n"
-                f"verses (JSON array of {{verse_id, sadr, ajuz}} objects):\n"
-                f"{verses_json}"
-            )
-
-            # Stable per-(input file, meter) thread_id: rerunning this
-            # script resumes the SAME checkpointed thread instead of
-            # silently starting a fresh, unrelated one each time.
-            thread_id = f"{input_path.stem}:{meter}"
-            run_config = {"configurable": {"thread_id": thread_id}}
-
-            try:
-                existing_state = agent.get_state(run_config)
-            except Exception:
-                existing_state = None
-
-            # trace_run() opens a fresh, unique trace_id for THIS invoke
-            # attempt (deliberately NOT the same thing as the LangGraph
-            # thread_id above, which stays stable across resumes on
-            # purpose — see tools/tracing.py's module docstring for why).
-            # The trace_id lets you inspect token usage / latency per
-            # agent (orchestrator, diacritizer, irab_checker,
-            # naturalness_critic) for this specific attempt, even if the
-            # same thread_id gets resumed multiple times.
-            with trace_run(label=meter, langgraph_thread_id=thread_id) as trace:
-                traced_config = {**run_config, "callbacks": [trace.callback]}
+        # Check if input file(s) are passed as a command-line argument
+        if len(sys.argv) > 1:
+            arg = sys.argv[1]
+            if arg == "--all":
+                jsonl_files = sorted(list(inputs_dir.glob("*.jsonl")))
                 print(
-                    f"[*] trace_id='{trace.trace_id}' "
-                    f"(inspect with: python -m tools.trace_report --trace {trace.trace_id})"
+                    f"[*] Processing ALL {len(jsonl_files)} input files in dataset/inputs/."
+                )
+            else:
+                arg_path = pathlib.Path(arg)
+                if arg_path.is_absolute() or arg_path.exists():
+                    jsonl_files = [arg_path]
+                else:
+                    # Check if it's a filename inside the inputs directory
+                    specific_file = inputs_dir / arg_path.name
+                    if specific_file.exists():
+                        jsonl_files = [specific_file]
+                    else:
+                        print(f"[-] Input file not found: {arg}")
+                        if inputs_dir.exists():
+                            print("[*] Available input files in dataset/inputs/:")
+                            for f in sorted(inputs_dir.glob("*.jsonl")):
+                                print(f"    - {f.name}")
+                        return
+        else:
+            # No argument provided; list and default to all files
+            jsonl_files = sorted(list(inputs_dir.glob("*.jsonl")))
+            if jsonl_files:
+                print(
+                    f"[*] No input file specified. Found {len(jsonl_files)} input files in dataset/inputs/."
+                )
+                print(
+                    "[*] Defaulting to processing ALL files. To run a single file, pass its name as an argument:"
+                )
+                print("    python main.py <filename.jsonl>")
+                print("[*] Starting the processing loop...")
+            else:
+                print(f"[-] No .jsonl files found in {inputs_dir}")
+                return
+
+        # Loop through all resolved input files
+        for input_path in jsonl_files:
+            print(f"\n" + "=" * 60)
+            print(f"[*] Reading inputs from: {input_path.name}")
+            print("=" * 60)
+
+            # 1. Read input verses
+            raw_verses = []
+            with input_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        raw_verses.append(json.loads(line))
+
+            if not raw_verses:
+                print(f"[-] No verses found in {input_path.name}. Skipping.")
+                continue
+
+            # 2. Group verses by meter to process them in coherent batches
+            batches_by_meter = {}
+            for v in raw_verses:
+                meter = v.get("meter", "taweel")  # default fallback if not specified
+                batches_by_meter.setdefault(meter, []).append(
+                    {
+                        "verse_id": v["verse_id"],
+                        "sadr": v["sadr"],
+                        "ajuz": v.get("ajuz", ""),
+                    }
                 )
 
+            # 3. Invoke the DeepAgent orchestrator for each batch
+            for meter, verses_batch in batches_by_meter.items():
+                print(
+                    f"[*] Processing batch of {len(verses_batch)} verses for meter: '{meter}' from '{input_path.name}'..."
+                )
+
+                # The graph's default state schema only recognizes "messages"
+                # (plus "files"/"todos"). Passing raw "input"/"verses"/
+                # "meter_name" top-level keys here silently drops them -- the
+                # model never sees the batch. So the verses + meter are
+                # embedded directly into the user message content as JSON
+                # instead.
+                verses_json = json.dumps(verses_batch, ensure_ascii=False, indent=2)
+                user_message = (
+                    f"Diacritize the following batch of verses against the meter "
+                    f"'{meter}'.\n\n"
+                    f"verses (JSON array of {{verse_id, sadr, ajuz}} objects):\n"
+                    f"{verses_json}"
+                )
+
+                # Stable per-(input file, meter) thread_id: rerunning this
+                # script resumes the SAME checkpointed thread instead of
+                # silently starting a fresh, unrelated one each time.
+                thread_id = f"{input_path.stem}:{meter}"
+                run_config = {"configurable": {"thread_id": thread_id}}
+
                 try:
-                    if existing_state and existing_state.next:
-                        # A previous run was interrupted (e.g. Ctrl+C)
-                        # partway through this exact thread_id, with a
-                        # pending next step. Passing None as input resumes
-                        # from the last completed checkpoint instead of
-                        # re-sending the original message and starting the
-                        # batch over.
+                    existing_state = agent.get_state(run_config)
+                except Exception:
+                    existing_state = None
+
+                # trace_run() opens a fresh, unique trace_id for THIS invoke
+                # attempt (deliberately NOT the same thing as the LangGraph
+                # thread_id above, which stays stable across resumes on
+                # purpose — see tools/tracing.py's module docstring for why).
+                # The trace_id lets you inspect token usage / latency per
+                # agent (orchestrator, diacritizer, irab_checker,
+                # naturalness_critic) for this specific attempt, even if the
+                # same thread_id gets resumed multiple times.
+                with trace_run(label=meter, langgraph_thread_id=thread_id) as trace:
+                    traced_config = {**run_config, "callbacks": [trace.callback]}
+                    print(
+                        f"[*] trace_id='{trace.trace_id}' "
+                        f"(inspect with: python -m tools.trace_report --trace {trace.trace_id})"
+                    )
+
+                    try:
+                        if existing_state and existing_state.next:
+                            # A previous run was interrupted (e.g. Ctrl+C)
+                            # partway through this exact thread_id, with a
+                            # pending next step. Passing None as input resumes
+                            # from the last completed checkpoint instead of
+                            # re-sending the original message and starting the
+                            # batch over.
+                            print(
+                                f"[*] Resuming interrupted thread '{thread_id}' "
+                                f"(next step: {existing_state.next})..."
+                            )
+                            try:
+                                response = agent.invoke(None, config=traced_config)
+                            except Exception as resume_exc:
+                                # A4: distinct branch from the fresh-invoke
+                                # path below -- a failure HERE specifically
+                                # means the checkpoint we tried to resume from
+                                # may itself be the problem, not just an
+                                # ordinary mid-run LLM/tool error. Name that
+                                # possibility explicitly rather than printing
+                                # the same generic message either way.
+                                print(
+                                    f"[-] Resume failed for thread '{thread_id}': {resume_exc}"
+                                )
+                                print(
+                                    "    The checkpoint may be corrupted or its state "
+                                    "incompatible with a fresh run. Run `PRAGMA "
+                                    f"integrity_check` against {checkpoint_db_path} to "
+                                    "confirm, or re-run with a modified thread_id "
+                                    "(e.g. append a suffix to input_path.stem) to "
+                                    "reprocess this batch from scratch instead of "
+                                    "resuming."
+                                )
+                                raise
+                        else:
+                            response = agent.invoke(
+                                {
+                                    "messages": [
+                                        {"role": "user", "content": user_message}
+                                    ]
+                                },
+                                config=traced_config,
+                            )
                         print(
-                            f"[*] Resuming interrupted thread '{thread_id}' "
-                            f"(next step: {existing_state.next})..."
+                            f"[+] Batch execution complete. Response status: {response}"
                         )
-                        try:
-                            response = agent.invoke(None, config=traced_config)
-                        except Exception as resume_exc:
-                            # A4: distinct branch from the fresh-invoke
-                            # path below -- a failure HERE specifically
-                            # means the checkpoint we tried to resume from
-                            # may itself be the problem, not just an
-                            # ordinary mid-run LLM/tool error. Name that
-                            # possibility explicitly rather than printing
-                            # the same generic message either way.
-                            print(
-                                f"[-] Resume failed for thread '{thread_id}': {resume_exc}"
-                            )
-                            print(
-                                "    The checkpoint may be corrupted or its state "
-                                "incompatible with a fresh run. Run `PRAGMA "
-                                f"integrity_check` against {checkpoint_db_path} to "
-                                "confirm, or re-run with a modified thread_id "
-                                "(e.g. append a suffix to input_path.stem) to "
-                                "reprocess this batch from scratch instead of "
-                                "resuming."
-                            )
-                            raise
-                    else:
-                        response = agent.invoke(
-                            {"messages": [{"role": "user", "content": user_message}]},
-                            config=traced_config,
+                    except Exception as e:
+                        print(
+                            f"[-] Execution failed for batch under meter '{meter}': {str(e)}"
                         )
-                    print(f"[+] Batch execution complete. Response status: {response}")
-                except Exception as e:
-                    print(
-                        f"[-] Execution failed for batch under meter '{meter}': {str(e)}"
-                    )
-                    print(
-                        f"    Checkpointed state for this run is saved under "
-                        f"thread_id='{thread_id}' in {checkpoint_db_path}. "
-                        f"Re-running this script will attempt to resume it."
-                    )
-                finally:
-                    print(
-                        f"[*] trace summary: python -m tools.trace_report --trace {trace.trace_id}"
-                    )
+                        print(
+                            f"    Checkpointed state for this run is saved under "
+                            f"thread_id='{thread_id}' in {checkpoint_db_path}. "
+                            f"Re-running this script will attempt to resume it."
+                        )
+                    finally:
+                        print(
+                            f"[*] trace summary: python -m tools.trace_report --trace {trace.trace_id}"
+                        )
     finally:
         # Guarantee resources are cleaned up and SQLite is not left with
         # dangling file descriptors
