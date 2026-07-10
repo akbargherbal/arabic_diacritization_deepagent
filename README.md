@@ -1,6 +1,6 @@
 # Arabic Prosody Diacritization — Dataset Builder (DeepAgents PoC)
 
-This project is a dataset generation pipeline designed to produce metrically sound, letter-faithful, and grammatically plausible diacritized Arabic poetry. It leverages large language models (LLMs) as generative drafters while enforcing deterministic quality criteria through automated validation gates to assemble high-fidelity training data.
+This project is a dataset generation pipeline designed to produce metrically sound, letter-faithful, and grammatically plausible diacritized Arabic poetry. It leverages Large Language Models (LLMs) as generative drafters while enforcing deterministic programmatic quality criteria through automated validation gates to assemble high-fidelity training data.
 
 ---
 
@@ -24,6 +24,7 @@ The primary purpose of this system is to compile training corpora of classical A
 The system utilizes an orchestrator-agent pattern, segregating generation from verification to maintain strict quality boundaries.
 
 ```
+
        [ Raw Undiacritized Inputs ]
                    │
                    ▼
@@ -40,37 +41,86 @@ The system utilizes an orchestrator-agent pattern, segregating generation from v
                            ├──► [PASS] ──► [ dataset/verses.jsonl ]
                            │
                            └──► [FAIL] ──► [ dataset/verses_rejected.jsonl ]
+
 ```
 
-### The Orchestrator
+### The Orchestrator & Validation Core
 
-The main control loop manages the execution pipeline:
+- **Orchestration**: Manages the execution pipeline over raw verse batches, enforcing a lock-on-success rule, a maximum of 3 correction passes, and automated state-saving checkpointing.
+- **Advisory Subagents**: Cooperating agents specializing in draft diacritization (`diacritizer`), grammatical analysis (`irab_checker`), and stylistic compliance (`naturalness_critic`).
+- **Four-Axis Validation**: To qualify for the final dataset, every proposed verse must clear three Deciding gates (Security, Fidelity, and Structural) and is annotated by a fourth Advisory axis (Linguistic) to determine if it should be committed with a review flag.
 
-1. Coordinates the subagents' batch processing.
-2. Implements a lock-on-success rule, shielding metrically sound verses from subsequent modifications.
-3. Facilitates mechanical case-ending (`إعراب`) adjustments where grammar and meter can be reconciled without altering rhythmic weights.
-4. Manages the iteration budget (maximum 3 passes) and routes unresolved or failed verses to the review queue.
-
-### Advisory Subagents
-
-- **Diacritizer**: Drafts and repairs diacritics (Harakat) for non-locked verses based on structural correction reports. It is restricted from modifying base letters.
-- **Irab Checker**: Advises on case-ending consistency and proposes minor, non-metrical vowel swaps to resolve basic grammatical errors.
-- **Naturalness Critic**: Identifies phonological stretches, unnatural silent letters, or stylistic anomalies introduced to artificially satisfy metrical constraints.
-
-### The Verification Gates (Four-Axis Validation)
-
-To qualify for the final dataset, every proposed verse must pass through three deciding gates and is annotated by a fourth advisory axis:
-
-1.  **Security Axis (Sanitizer)** `[Deciding]`: Scans unicode ranges to ensure only expected Arabic characters and punctuation are present.
-2.  **Fidelity Axis (Consonants)** `[Deciding]`: Strips diacritics from the proposed output and performs an exact string comparison against the original undiacritized input. Any consonant modification triggers a hard reject.
-3.  **Structural Axis (pyarud)** `[Deciding]`: Runs a prosodic analysis to confirm the verse conforms to the expected syllable weight patterns.
-4.  **Linguistic Axis (LLM Advisory)** `[Advisory]`: Captures and documents irab or naturalness flags. Flagged verses are committed but tagged as `needs_review`.
+For a detailed walkthrough of the pipeline flow, subagent prompts, and the mechanical case-ending reconciliation loop, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
-## 4. Dataset Integrity
+## 4. Quick Start
 
-The pipeline generates two output streams:
+### Installation & Setup
 
-- **`dataset/verses.jsonl`**: The primary output corpus containing only verses that successfully cleared all deciding gates.
-- **`dataset/verses_rejected.jsonl`**: A uniform diagnostic log capturing every failed attempt. It lists the rejection stage, structural scores, character-level diffs, and validation notes to assist human operators in auditing false positives or system bugs.
+1. Clone the repository and navigate to the project root:
+   ```bash
+   cd arabic_diacritization_deepagent
+   ```
+
+````
+
+2. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Set your target model provider API keys and optional custom base URLs in your environment:
+   ```bash
+   export MODEL_PROVIDER="deepseek"
+   export DEEPSEEK_API_KEY="your-api-key"
+   ```
+
+### Running the Pipeline
+
+To run the diacritization pipeline against the standard inputs:
+
+```bash
+python main.py
+```
+
+- **Checkpoint & Resume**: If interrupted mid-flight (e.g., via `Ctrl+C`), re-running the script will automatically resume from the last saved state in `checkpoints.sqlite` using LangGraph's native checkpointer.
+
+---
+
+## 5. Directory Structure
+
+```
+.
+├── AGENTS.md                 # Agent charter, persistent rules, and design rationale
+├── README.md                 # This file (Project Overview & Quick Start)
+├── main.py                   # Main pipeline entrypoint and orchestrator agent
+├── requirements.txt          # Python dependencies
+├── backends/
+│   └── model_provider.py    # Multi-provider model loader with retry and timeout layers
+├── config/
+│   └── meter_tables.py       # Ground-truth poetic meter templates & canonical patterns
+├── dataset/
+│   ├── inputs/               # Untrusted raw input batches (e.g., batch_01.jsonl)
+│   ├── verses.jsonl          # High-fidelity committed dataset (Deciding gates passed)
+│   └── verses_rejected.jsonl # Uniform diagnostic log of all rejected attempts
+├── docs/                     # Detailed technical and execution documentation
+│   ├── ARCHITECTURE.md       # Pipeline flows, subagents, and reconciliation details
+│   ├── CONFIGURATION.md      # Sandbox permissions, model provider parameters, & checkpointing
+│   └── TRACING.md            # Execution token tracing & offline reporting
+├── logs/disagreements/       # JSON exports of advisory flags and unresolved failures
+├── skills/                   # Guidance and rules loaded dynamically by subagents
+├── subagents/                # Advisory and generative agent prompt declarations
+└── tools/                    # Core programmatic validation and debugging utilities
+```
+
+---
+
+## 6. Documentation Index
+
+For advanced configuration, auditing, and architectural specifics, refer to the following documents:
+
+- **[AGENTS.md](AGENTS.md)**: Persistent memory, non-negotiable behavior constraints, and project rules.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: Deep dive into the orchestrator loop, subagents, validation axes, and the case-ending swap reconciliation tool.
+- **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**: Technical breakdown of DeepAgents security paths, local database checkpointing settings, and supported LLM backends (Anthropic, OpenAI, DeepSeek, and NVIDIA NIM).
+- **[docs/TRACING.md](docs/TRACING.md)**: Guide to using `traces.sqlite` and the trace reporting CLI to audit latency, token counts, and execution runs.
+````
