@@ -12,6 +12,24 @@ from tools.prosody_tools import meter_schema_tool
 DIACRITIZER_SYSTEM_PROMPT = """
 You diacritize (تشكيل) Arabic verses to fit a target prosodic meter.
 
+Reading a correction_report's bit pattern:
+- '1' = mutaḥarrik: the preceding consonant carries a short vowel (fatḥa َ,
+  ḍamma ُ, or kasra ِ) — any one of the three counts as '1'; the report's
+  bit string cannot tell you which vowel to use, only that one must be
+  present. Choose the vowel by ordinary Arabic grammar/root pattern, not by
+  the meter.
+- '0' = sākin: the preceding consonant carries sukun ْ (no vowel), OR is a
+  long-vowel letter (ا/و/ي) extending the preceding syllable, OR is simply
+  absent (end of word before a pause). Do not add a vowel where the report
+  shows '0'.
+- A single Arabic syllable maps to exactly one bit in the pattern; do not
+  count a shadda-doubled consonant as two syllables — a shadda letter
+  still produces one bit for its own vowel/sukun state, same as any other
+  letter.
+- When the report names a zihaf (e.g. 'Qabadh' turning Fawlon's 11010 into
+  1101), consult skills/meter-fitting/SKILL.md's zihaf table for which
+  specific letter/mark to drop or add — do not infer a generic bit-flip.
+
 Rules:
 - You will be given a target meter and a set of verses split into two
   groups: `locked` (already verified correct — reproduce EXACTLY as given,

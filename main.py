@@ -10,6 +10,21 @@ schema, and interrupt_on condition syntax move fast on this framework.
 Confirm this against docs.langchain.com/oss/python/deepagents before
 relying on it in production. What's below reflects the framework's
 documented shape at design time, not a guarantee of the current API.
+
+CHANGE (A4): agent/checkpointer construction used to happen at MODULE
+IMPORT time, which meant merely importing this module (from a test, a
+notebook, a future second entrypoint) opened a real sqlite3 connection to
+checkpoints.sqlite and ran the integrity_check query as a side effect.
+That construction now lives in build_agent(), called from main() under the
+__main__ guard, so importing this module has no side effects.
+
+CHANGE (A4): the resume path (agent.invoke(None, ...)) previously shared
+the exact same broad except-Exception branch as a fresh invoke, printing
+an identical generic message either way. It now has its own except branch
+that names the corruption possibility explicitly and suggests a concrete
+next step (fresh thread_id) rather than leaving the operator to guess
+whether a resume failure is an ordinary run-time error or a checkpoint
+integrity problem.
 """
 
 import json
@@ -30,6 +45,7 @@ from tools.prosody_tools import (
 from tools.dataset_tools import commit_verse_tool, log_unresolved_tool
 from tools.sanitization_tools import sanitize_output_tool
 from tools.reconciliation_tools import reconcile_case_ending_tool
+from tools.context_tools import summarize_correction_report_tool
 from tools.tracing import trace_run
 from subagents.diacritizer import DIACRITIZER_SUBAGENT
 from subagents.irab_checker_agent import IRAB_SUBAGENT
@@ -130,6 +146,31 @@ Pass budget: maximum {MAX_CORRECTION_PASSES} correction passes per batch.
 Verses still broken after that are logged via log_unresolved_tool and
 EXCLUDED from the dataset — do not force a further pass, do not auto-accept.
 
+--- Context discipline across correction passes ---
+
+verify_batch_tool's correction_report is a complete, per-foot diagnostic
+text. Do not let it accumulate unpruned in your own reasoning across
+passes — that is the single largest token-cost driver in this system.
+Concretely:
+
+  1. After each verify_batch_tool call, write its full correction_report to
+     /workspace/pass_{{n}}_report.json (n = current pass number, starting
+     at 1) instead of quoting the full text back into your own reasoning.
+     Use summarize_correction_report_tool on the returned poem_result_json
+     to get a terse "verse_id: score" summary for your OWN bookkeeping of
+     which verses remain broken pass over pass — that summary, not the
+     full report, is what should persist in your own context.
+  2. When dispatching the diacritizer subagent for a given pass, hand it
+     ONLY that pass's fresh correction_report (read from the file you just
+     wrote, or the tool's return value directly) plus the verse's original
+     input text. Never re-paste a prior pass's correction_report, and
+     never re-include a verse's prior-pass rejected draft text — it already
+     failed verify_batch_tool and carries no diagnostic value the fresh
+     report doesn't already contain better.
+  3. Locked verses need no report at all in any pass — they are not
+     resubmitted (see Locking rule above), so nothing about them belongs
+     in a dispatch to the diacritizer.
+
 --- Handling a pyarud/إعراب disagreement (two-step, in this order) ---
 
 After a verse is locked, dispatch it to BOTH irab_checker and
@@ -138,8 +179,10 @@ naturalness_critic (advisory, non-gating, via task tool).
 If irab_checker returns flag=true with fix_type="case_ending_swap":
   1. This is NOT automatically poetic license — attempt reconciliation
      FIRST. Call reconcile_case_ending_tool with the word_index and
-     target_harakah it proposed. This performs a mechanical fatha/damma/
-     kasra swap, which cannot change the metrical pattern.
+     target_harakah it proposed (target_harakah may now be a tanwin mark —
+     fathatayn/dammatayn/kasratayn — in addition to the plain short
+     vowels). This performs a mechanical vowel/tanwin swap, which cannot
+     change the metrical pattern.
   2. Re-run verify_single_verse_tool on the reconciled text.
   3. If it still passes: this was a genuine grammar fix with no metrical
      cost. Commit the reconciled text via commit_verse_tool with
@@ -164,105 +207,122 @@ triggers reconciliation (there is no mechanical fix for "reads unnatural").
 
 commit_verse_tool re-verifies pyarud and sanitization itself before
 writing — treat its "committed": false response as authoritative, not a
-bug to route around.
+bug to route around. A "duplicate": true response means this exact verse
+(or an identical text under a different verse_id) was already committed —
+treat that as already handled, not as a failure to retry.
 """
 
-# Instantiates model with providers based on environment setup with retry safety
-MODEL = get_model()
 
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
-# Persists graph state (messages, files, todos) to a local SQLite file after
-# every completed step. This is separate from BACKEND above: BACKEND is the
-# agent's *virtual filesystem* (what ls/read_file/write_file see), while the
-# checkpointer is LangGraph's own run history (what step you're on, what's
-# been said so far) -- it's what lets you inspect or resume a run that was
-# interrupted mid-flight, e.g. with Ctrl+C while waiting on a slow model call.
-#
-# check_same_thread=False is required because SqliteSaver may be touched from
-# a different thread than the one that opened the connection in some
-# LangGraph execution paths, even in this synchronous script.
-#
-# NOTE: requires langgraph-checkpoint-sqlite>=3.0.1 (earlier releases carry
-# a SQL-injection vulnerability in the SQLite checkpointer, CVE-2025-67644,
-# fixed in 3.0.1) -- pin this in requirements.txt.
-CHECKPOINT_DB_PATH = PROJECT_ROOT / "checkpoints.sqlite"
-checkpoint_conn = sqlite3.connect(str(CHECKPOINT_DB_PATH), check_same_thread=False)
+def build_agent():
+    """Construct the checkpointer and the deep agent. Called from main()
+    under the __main__ guard so that merely importing this module (e.g.
+    from a test) has no side effects -- no sqlite connection is opened and
+    no model client is constructed at import time (A4)."""
 
-# Optimization Pragma Settings (PRAGMA setup runs prior to SqliteSaver)
-checkpoint_conn.execute("PRAGMA busy_timeout = 30000")
-checkpoint_conn.execute("PRAGMA synchronous = NORMAL")
+    # Instantiates model with providers based on environment setup with retry safety
+    model = get_model()
 
-# Startup Diagnostics: database file integrity check
-try:
-    cursor = checkpoint_conn.cursor()
-    cursor.execute("PRAGMA integrity_check")
-    integrity_result = cursor.fetchone()[0]
-    if integrity_result != "ok":
-        print(
-            f"[!] Warning: Checkpoint database corrupted. PRAGMA integrity_check returned: {integrity_result}"
-        )
-except Exception as exc:
-    print(f"[-] Pre-run checkpoint diagnostic failed: {exc}")
+    # -----------------------------------------------------------------
+    # Checkpointing
+    # -----------------------------------------------------------------
+    # Persists graph state (messages, files, todos) to a local SQLite file
+    # after every completed step. This is separate from BACKEND above:
+    # BACKEND is the agent's *virtual filesystem* (what ls/read_file/
+    # write_file see), while the checkpointer is LangGraph's own run
+    # history (what step you're on, what's been said so far) -- it's what
+    # lets you inspect or resume a run that was interrupted mid-flight,
+    # e.g. with Ctrl+C while waiting on a slow model call.
+    #
+    # check_same_thread=False is required because SqliteSaver may be
+    # touched from a different thread than the one that opened the
+    # connection in some LangGraph execution paths, even in this
+    # synchronous script.
+    #
+    # NOTE: requires langgraph-checkpoint-sqlite>=3.0.1 (earlier releases
+    # carry a SQL-injection vulnerability in the SQLite checkpointer,
+    # CVE-2025-67644, fixed in 3.0.1) -- pin this in requirements.txt.
+    checkpoint_db_path = PROJECT_ROOT / "checkpoints.sqlite"
+    checkpoint_conn = sqlite3.connect(str(checkpoint_db_path), check_same_thread=False)
 
-checkpointer = SqliteSaver(checkpoint_conn)
+    # Optimization Pragma Settings (PRAGMA setup runs prior to SqliteSaver)
+    checkpoint_conn.execute("PRAGMA busy_timeout = 30000")
+    checkpoint_conn.execute("PRAGMA synchronous = NORMAL")
 
-# ---------------------------------------------------------------------------
-# Subagent skill assignment
-# ---------------------------------------------------------------------------
-# Inject skill directory permissions dynamically into subagent dict structures
-# so that deepagents' graph creation middleware exposes them to the agents.
-DIACRITIZER_SUBAGENT["skills"] = ["/skills/"]
-IRAB_SUBAGENT["skills"] = ["/skills/"]
+    # Startup Diagnostics: database file integrity check
+    try:
+        cursor = checkpoint_conn.cursor()
+        cursor.execute("PRAGMA integrity_check")
+        integrity_result = cursor.fetchone()[0]
+        if integrity_result != "ok":
+            print(
+                f"[!] Warning: Checkpoint database corrupted. PRAGMA integrity_check returned: {integrity_result}"
+            )
+    except Exception as exc:
+        print(f"[-] Pre-run checkpoint diagnostic failed: {exc}")
 
-agent = create_deep_agent(
-    model=MODEL,
-    tools=[
-        verify_batch_tool,
-        meter_schema_tool,
-        verify_single_verse_tool,
-        commit_verse_tool,
-        log_unresolved_tool,
-        sanitize_output_tool,
-        reconcile_case_ending_tool,
-    ],
-    system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
-    permissions=PERMISSIONS,
-    backend=BACKEND,
-    subagents=[DIACRITIZER_SUBAGENT, IRAB_SUBAGENT, NATURALNESS_CRITIC_SUBAGENT],
-    checkpointer=checkpointer,
-    skills=["/skills/"],
-    interrupt_on={
-        # Optional circuit-breaker (see design doc §6). Not a per-verse gate —
-        # you explicitly declined that. This only pauses once per batch if
-        # the disagreement rate looks anomalous. Delete this block entirely
-        # if you'd rather have zero interrupts.
-        "finalize_batch": {"mode": "approve", "condition": "disagreement_rate > 0.25"},
-    },
-)
+    checkpointer = SqliteSaver(checkpoint_conn)
+
+    # -----------------------------------------------------------------
+    # Subagent skill assignment
+    # -----------------------------------------------------------------
+    # Inject skill directory permissions dynamically into subagent dict
+    # structures so that deepagents' graph creation middleware exposes
+    # them to the agents.
+    DIACRITIZER_SUBAGENT["skills"] = ["/skills/"]
+    IRAB_SUBAGENT["skills"] = ["/skills/"]
+
+    agent = create_deep_agent(
+        model=model,
+        tools=[
+            verify_batch_tool,
+            meter_schema_tool,
+            verify_single_verse_tool,
+            commit_verse_tool,
+            log_unresolved_tool,
+            sanitize_output_tool,
+            reconcile_case_ending_tool,
+            summarize_correction_report_tool,
+        ],
+        system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
+        permissions=PERMISSIONS,
+        backend=BACKEND,
+        subagents=[DIACRITIZER_SUBAGENT, IRAB_SUBAGENT, NATURALNESS_CRITIC_SUBAGENT],
+        checkpointer=checkpointer,
+        skills=["/skills/"],
+        interrupt_on={
+            # Optional circuit-breaker (see design doc §6). Not a per-verse
+            # gate — you explicitly declined that. This only pauses once
+            # per batch if the disagreement rate looks anomalous. Delete
+            # this block entirely if you'd rather have zero interrupts.
+            "finalize_batch": {"mode": "approve", "condition": "disagreement_rate > 0.25"},
+        },
+    )
+
+    return agent, checkpoint_conn, checkpoint_db_path
 
 
-if __name__ == "__main__":
-    # Define absolute paths
-    INPUT_PATH = PROJECT_ROOT / "dataset" / "inputs" / "batch_01.jsonl"
-
-    if not INPUT_PATH.exists():
-        print(f"[-] Input file not found at {INPUT_PATH}")
-        print("[*] Please create the input file with your normalized verses first.")
-        exit(1)
+def main() -> None:
+    agent, checkpoint_conn, checkpoint_db_path = build_agent()
 
     try:
+        # Define absolute paths
+        input_path = PROJECT_ROOT / "dataset" / "inputs" / "batch_01.jsonl"
+
+        if not input_path.exists():
+            print(f"[-] Input file not found at {input_path}")
+            print("[*] Please create the input file with your normalized verses first.")
+            return
+
         # 1. Read input verses
         raw_verses = []
-        with INPUT_PATH.open("r", encoding="utf-8") as f:
+        with input_path.open("r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     raw_verses.append(json.loads(line))
 
         if not raw_verses:
             print("[-] No verses found in the input file.")
-            exit(0)
+            return
 
         # 2. Group verses by meter to process them in coherent batches
         batches_by_meter = {}
@@ -283,10 +343,11 @@ if __name__ == "__main__":
             )
 
             # The graph's default state schema only recognizes "messages"
-            # (plus "files"/"todos"). Passing raw "input"/"verses"/"meter_name"
-            # top-level keys here silently drops them -- the model never sees
-            # the batch. So the verses + meter are embedded directly into the
-            # user message content as JSON instead.
+            # (plus "files"/"todos"). Passing raw "input"/"verses"/
+            # "meter_name" top-level keys here silently drops them -- the
+            # model never sees the batch. So the verses + meter are
+            # embedded directly into the user message content as JSON
+            # instead.
             verses_json = json.dumps(verses_batch, ensure_ascii=False, indent=2)
             user_message = (
                 f"Diacritize the following batch of verses against the meter "
@@ -295,10 +356,10 @@ if __name__ == "__main__":
                 f"{verses_json}"
             )
 
-            # Stable per-(input file, meter) thread_id: rerunning this script
-            # resumes the SAME checkpointed thread instead of silently starting a
-            # fresh, unrelated one each time.
-            thread_id = f"{INPUT_PATH.stem}:{meter}"
+            # Stable per-(input file, meter) thread_id: rerunning this
+            # script resumes the SAME checkpointed thread instead of
+            # silently starting a fresh, unrelated one each time.
+            thread_id = f"{input_path.stem}:{meter}"
             run_config = {"configurable": {"thread_id": thread_id}}
 
             try:
@@ -306,13 +367,14 @@ if __name__ == "__main__":
             except Exception:
                 existing_state = None
 
-            # trace_run() opens a fresh, unique trace_id for THIS invoke attempt
-            # (deliberately NOT the same thing as the LangGraph thread_id above,
-            # which stays stable across resumes on purpose — see
-            # tools/tracing.py's module docstring for why). The trace_id lets
-            # you inspect token usage / latency per agent (orchestrator,
-            # diacritizer, irab_checker, naturalness_critic) for this specific
-            # attempt, even if the same thread_id gets resumed multiple times.
+            # trace_run() opens a fresh, unique trace_id for THIS invoke
+            # attempt (deliberately NOT the same thing as the LangGraph
+            # thread_id above, which stays stable across resumes on
+            # purpose — see tools/tracing.py's module docstring for why).
+            # The trace_id lets you inspect token usage / latency per
+            # agent (orchestrator, diacritizer, irab_checker,
+            # naturalness_critic) for this specific attempt, even if the
+            # same thread_id gets resumed multiple times.
             with trace_run(label=meter, langgraph_thread_id=thread_id) as trace:
                 traced_config = {**run_config, "callbacks": [trace.callback]}
                 print(
@@ -322,16 +384,39 @@ if __name__ == "__main__":
 
                 try:
                     if existing_state and existing_state.next:
-                        # A previous run was interrupted (e.g. Ctrl+C) partway
-                        # through this exact thread_id, with a pending next step.
-                        # Passing None as input resumes from the last completed
-                        # checkpoint instead of re-sending the original message and
-                        # starting the batch over.
+                        # A previous run was interrupted (e.g. Ctrl+C)
+                        # partway through this exact thread_id, with a
+                        # pending next step. Passing None as input resumes
+                        # from the last completed checkpoint instead of
+                        # re-sending the original message and starting the
+                        # batch over.
                         print(
                             f"[*] Resuming interrupted thread '{thread_id}' "
                             f"(next step: {existing_state.next})..."
                         )
-                        response = agent.invoke(None, config=traced_config)
+                        try:
+                            response = agent.invoke(None, config=traced_config)
+                        except Exception as resume_exc:
+                            # A4: distinct branch from the fresh-invoke
+                            # path below -- a failure HERE specifically
+                            # means the checkpoint we tried to resume from
+                            # may itself be the problem, not just an
+                            # ordinary mid-run LLM/tool error. Name that
+                            # possibility explicitly rather than printing
+                            # the same generic message either way.
+                            print(
+                                f"[-] Resume failed for thread '{thread_id}': {resume_exc}"
+                            )
+                            print(
+                                "    The checkpoint may be corrupted or its state "
+                                "incompatible with a fresh run. Run `PRAGMA "
+                                f"integrity_check` against {checkpoint_db_path} to "
+                                "confirm, or re-run with a modified thread_id "
+                                "(e.g. append a suffix to input_path.stem) to "
+                                "reprocess this batch from scratch instead of "
+                                "resuming."
+                            )
+                            raise
                     else:
                         response = agent.invoke(
                             {"messages": [{"role": "user", "content": user_message}]},
@@ -344,7 +429,7 @@ if __name__ == "__main__":
                     )
                     print(
                         f"    Checkpointed state for this run is saved under "
-                        f"thread_id='{thread_id}' in {CHECKPOINT_DB_PATH}. "
+                        f"thread_id='{thread_id}' in {checkpoint_db_path}. "
                         f"Re-running this script will attempt to resume it."
                     )
                 finally:
@@ -352,6 +437,11 @@ if __name__ == "__main__":
                         f"[*] trace summary: python -m tools.trace_report --trace {trace.trace_id}"
                     )
     finally:
-        # Guarantee resources are cleaned up and SQLite is not left with dangling file descriptors
+        # Guarantee resources are cleaned up and SQLite is not left with
+        # dangling file descriptors
         print("[*] Terminating run. Closing checkpoint DB stream connection...")
         checkpoint_conn.close()
+
+
+if __name__ == "__main__":
+    main()

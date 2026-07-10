@@ -48,6 +48,23 @@ IMPORTANT — concurrency:
   other API misuse') -- this is not hypothetical, it's what happened the
   first time this traced a batch with parallel subagent dispatch.
 
+IMPORTANT — cross-process safety (added):
+  WAL mode alone lets readers avoid blocking on a writer's snapshot, but it
+  does NOT eliminate SQLITE_BUSY between two *writers* (e.g. this process
+  writing while `tools/trace_report.py` is invoked, or two `main.py`
+  processes pointed at the same file). A `busy_timeout` pragma is set
+  immediately after connecting so SQLite retries internally for a bounded
+  window instead of raising immediately -- mirroring the same defense
+  main.py already applies to checkpoints.sqlite.
+
+IMPORTANT — connection lifetime (changed):
+  Previously, `trace_run()` constructed a brand-new TraceStore (and thus a
+  brand-new sqlite3 connection) for every batch, closing it at the end of
+  the `with` block. That's needless connect/close churn across a
+  multi-meter input file processed in one `main.py` run. `trace_run()` now
+  reuses a single module-level TraceStore per (process, db_path), created
+  lazily on first use and left open for the life of the process.
+
 ---------------------------------------------------------------------------
 USAGE (see main.py for the wired-in version)
 ---------------------------------------------------------------------------
@@ -94,6 +111,7 @@ DEFAULT_DB_PATH = Path("traces.sqlite")
 DISPATCH_TOOL_NAME = "task"  # deepagents' subagent-dispatch tool
 SUBAGENT_ARG_KEYS = ("subagent_type", "subagent", "agent_type")  # defensive
 ORCHESTRATOR = "orchestrator"
+BUSY_TIMEOUT_MS = 30000  # mirrors main.py's checkpoint_conn setting
 
 
 def _utcnow_iso() -> str:
@@ -117,6 +135,12 @@ class TraceStore:
     run parallel tool calls -- because every write is serialized through
     self._lock. check_same_thread=False alone is not sufficient for that;
     see the module docstring's "IMPORTANT — concurrency" section.
+
+    Also sets a busy_timeout pragma so cross-PROCESS writer collisions
+    (e.g. this process vs. a concurrently-run trace_report.py, or two
+    main.py processes against the same db_path) retry for a bounded window
+    instead of raising sqlite3.OperationalError("database is locked")
+    immediately. See "IMPORTANT — cross-process safety" above.
     """
 
     def __init__(self, db_path: Path = DEFAULT_DB_PATH):
@@ -124,6 +148,7 @@ class TraceStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._lock = threading.Lock()
         with self._lock:
+            self._conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};")
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._init_schema()
 
@@ -160,7 +185,18 @@ class TraceStore:
                 error           TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_calls_trace ON calls(trace_id);
+            -- Chronological lookups (list_runs / _latest_trace_id in
+            -- trace_report.py) sort runs by started_at -- index it so that's
+            -- not a full-table scan + in-memory sort as the table grows.
+            CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
+
+            -- dump_calls() in trace_report.py filters by trace_id AND sorts
+            -- by started_at -- a composite index satisfies both in one
+            -- lookup instead of filtering then sorting separately. This
+            -- also covers every query that previously relied on
+            -- idx_calls_trace (trace_id alone is a prefix of this index).
+            CREATE INDEX IF NOT EXISTS idx_calls_trace_started ON calls(trace_id, started_at);
+
             CREATE INDEX IF NOT EXISTS idx_calls_agent ON calls(trace_id, agent);
             """)
         self._conn.commit()
@@ -488,6 +524,23 @@ class Trace:
 
 _current_trace: ContextVar[Optional[Trace]] = ContextVar("_current_trace", default=None)
 
+# Module-level, lazily-initialized store shared across all trace_run() calls
+# in this process, keyed by resolved db_path. Avoids a connect()/close() pair
+# per batch (see "IMPORTANT — connection lifetime" above). Guarded by its own
+# lock since trace_run() may itself be entered from multiple threads.
+_stores: dict[str, TraceStore] = {}
+_stores_lock = threading.Lock()
+
+
+def _get_store(db_path: Path) -> TraceStore:
+    key = str(Path(db_path).resolve())
+    with _stores_lock:
+        store = _stores.get(key)
+        if store is None:
+            store = TraceStore(db_path)
+            _stores[key] = store
+        return store
+
 
 def current_trace() -> Optional[Trace]:
     """Fetch the Trace for the currently-running `trace_run` block, if any."""
@@ -504,8 +557,14 @@ def trace_run(
     Open a new trace for one `agent.invoke(...)` attempt. Generates a fresh,
     unique trace_id every call (including resumed attempts on the same
     LangGraph thread_id) so each attempt is independently inspectable.
+
+    The underlying TraceStore/connection is shared across calls in this
+    process (see _get_store) rather than opened and closed per call; it is
+    intentionally NOT closed when this context manager exits, since another
+    trace_run() may follow immediately (e.g. the next meter in main.py's
+    batch loop). It closes when the process exits.
     """
-    store = TraceStore(db_path)
+    store = _get_store(db_path)
     trace_id = new_trace_id()
     store.start_run(trace_id, langgraph_thread_id, label)
     trace = Trace(
@@ -520,4 +579,5 @@ def trace_run(
     finally:
         store.end_run(trace_id)
         _current_trace.reset(token)
-        store.close()
+        # No store.close() here -- the store outlives any single trace_run()
+        # call; see module docstring's "IMPORTANT — connection lifetime".

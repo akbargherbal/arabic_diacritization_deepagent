@@ -54,9 +54,21 @@ def verify_batch_tool(verses: list[dict], meter_name: str) -> dict:
     poem_result = prosody.analyze_poem(pairs, meter_name=meter_name)
 
     locked, broken = [], []
+    # verse_scores is a terse (verse_id, combined_score) list, added purely
+    # so the orchestrator's own bookkeeping across correction passes
+    # (see tools/context_tools.py's summarize_correction_report_tool) can
+    # carry a few tokens per verse instead of re-embedding the full
+    # per-foot correction_report text every pass. This does NOT touch or
+    # duplicate anything from verification/ itself -- it's assembled here,
+    # in the agent-facing wrapper layer, from data verify_batch_tool
+    # already computed.
+    verse_scores = []
     for v, verse_result in zip(verses, poem_result.verses):
         target = locked if verse_result.combined_score >= 0.99 else broken
         target.append(v["verse_id"])
+        verse_scores.append(
+            {"verse_id": v["verse_id"], "combined_score": verse_result.combined_score}
+        )
 
     report = prosody.generate_poem_correction_report(poem_result, only_broken=True)
 
@@ -67,7 +79,8 @@ def verify_batch_tool(verses: list[dict], meter_name: str) -> dict:
         "poem_result_json": json.dumps(
             {"overall_score": poem_result.overall_score,
              "is_metrically_sound": poem_result.is_metrically_sound,
-             "candidate_meters": poem_result.candidate_meters},
+             "candidate_meters": poem_result.candidate_meters,
+             "verse_scores": verse_scores},
             ensure_ascii=False,
         ),
     }

@@ -17,12 +17,16 @@ Loaded by the `irab_checker` subagent to evaluate whether a metrically correct A
 You must classify every detected issue into one of these two categories:
 
 ### 1. `case_ending_swap` (Mechanically Fixable)
-*   **Definition:** The grammatical error is purely on the final short vowel mark (fatha, damma, kasra) of a single word, where changing it resolves the error completely.
-*   **Metrical Impact:** Metrically free! The parser scans only vowel presence (harakah vs. sukun), not the identity of the short vowel. Swapping a damma for a kasra does not alter the meter.
-*   **Action:** Propose a mechanical swap. Provide the whitespace-split, 0-indexed `word_index` and the target vowel mark (`target_harakah`: `"fatha"` | `"damma"` | `"kasra"`).
+*   **Definition:** The grammatical error is purely on the final vowel mark of a single word, where changing it resolves the error completely. This covers two related cases:
+    *   Swapping among the three basic short vowels (fatha/damma/kasra) on a definite ending.
+    *   Swapping to/from tanwin (fathatayn/dammatayn/kasratayn) on an **indefinite** noun ending.
+*   **Metrical Impact:** Metrically free in both cases! The parser scans only vowel presence (harakah vs. sukun), not the identity of the short vowel, and a tanwin mark is a single mutaharrik unit exactly like a plain short vowel. Swapping a damma for a kasra, or a dammatayn for a fathatayn, does not alter the meter.
+*   **Action:** Propose a mechanical swap. Provide the whitespace-split, 0-indexed `word_index` and the target vowel mark (`target_harakah`: `"fatha"` | `"damma"` | `"kasra"` | `"fathatayn"` | `"dammatayn"` | `"kasratayn"`).
 *   **Examples:**
     *   *على الكتبُ* (wrong nominative after a preposition) $\rightarrow$ swap to *على الكتبِ* (genitive `kasra`).
     *   *إنّ زيدٌ* (wrong nominative noun of *Inna*) $\rightarrow$ swap to *إنّ زيداً* (accusative `fatha`).
+    *   *رأيتُ كِتَابٌ* (indefinite object wrongly left nominative-tanwin) $\rightarrow$ swap to *رأيتُ كِتَاباً* (accusative `fathatayn` — note the accompanying orthographic alif seat; `tools/reconciliation_tools.py` applies this automatically when swapping to `fathatayn`, except on تاء مربوطة، ألف مقصورة، or hamza-already-on-alif endings).
+    *   *مررتُ بكِتَابٌ* (indefinite object of a preposition wrongly left nominative-tanwin) $\rightarrow$ swap to *مررتُ بكِتَابٍ* (genitive `kasratayn`, no alif seat involved).
 
 ### 2. `structural` (Metrically Non-Free / Poetic License)
 *   **Definition:** Fixing the grammatical issue requires changing consonantal letters, adding/dropping syllables, altering internal/middle short vowels, or changing a final vowel to or from a sukun.
@@ -42,10 +46,34 @@ Flag ONLY unambiguous, clear-cut grammatical breaks:
 
 ## Negative List (Edge Cases Out of Scope — DO NOT FLAG)
 
-Do not over-flag legitimate classical constructions. Treat the following as grammatically plausible:
-*   **Mamnu' min al-Sarf (الممنوع من الصرف):** Words on specific morphological structures that end in fatha instead of kasra when genitive. Do not flag them.
-*   **Weak Verbs:** Dropping or keeping weak vowels in atypical positions, which often follows less common dialectical rules (*lughat*).
-*   **Ellipsis (حذف):** Omission of standard nouns or particles when implied by context.
+Do not over-flag legitimate classical constructions. Treat the following as
+grammatically plausible:
+
+*   **Mamnu' min al-Sarf (الممنوع من الصرف):** Words on specific
+    morphological structures that end in fatha instead of kasra when
+    genitive. Do not flag them.
+*   **Sakin Collision (التقاء الساكنين):** When a word's final sakin
+    consonant meets the next word's initial consonant across a hemistich
+    boundary or in fluid recitation, the resulting reading may require a
+    helping vowel or elision that looks like a case-ending anomaly when the
+    word is read in isolation. Before flagging, check whether the apparent
+    error resolves once the word is read together with its neighbor — if it
+    does, this is not an error.
+*   **Weak Verb Truncation (حذف حرف العلة للجزم):** A weak/muʿtall verb
+    (root containing و/ي/ا) legitimately DROPS its final weak letter under
+    jussim (جزم) — e.g. لم يَقُلْ (not لم يَقُولْ), لم يَخْشَ (not لم يَخْشَى).
+    This is standard grammar, not poetic license — never flag it as an
+    error, and never propose a `case_ending_swap` for it (there is no vowel
+    swap that "fixes" a correctly-truncated weak verb).
+*   **Weak Verb Dialectal Vowel Variation:** Distinct from truncation above
+    — an atypical but attested short-vowel choice on a weak verb's
+    remaining letters (not a truncation question). This is a much weaker
+    "don't flag" signal than truncation above; if genuinely uncertain, a
+    low-confidence `structural` flag with a note explaining the specific
+    dialectal reading considered is acceptable here, unlike the other items
+    in this list.
+*   **Ellipsis (حذف):** Omission of standard nouns or particles when implied
+    by context.
 
 ---
 
@@ -58,4 +86,4 @@ Common poetic licenses include:
 
 ## Status
 
-Fully configured. Grounded in standard classical grammar rules and compatible with the orchestrator's automated reconciliation tools.
+Fully configured. Grounded in standard classical grammar rules and compatible with the orchestrator's automated reconciliation tools, including the tanwin extension in `tools/reconciliation_tools.py`.

@@ -31,11 +31,19 @@ from pathlib import Path
 
 from tools.tracing import DEFAULT_DB_PATH
 
+# Mirrors tools/tracing.py's BUSY_TIMEOUT_MS -- this CLI opens its own,
+# separate connection to the same traces.sqlite file that the live agent
+# run may be writing to concurrently. Without a timeout, running this
+# report mid-batch can raise sqlite3.OperationalError("database is locked")
+# instead of just waiting briefly for the writer to finish its commit.
+BUSY_TIMEOUT_MS = 30000
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise SystemExit(f"No trace database found at {db_path}. Run something with trace_run() first.")
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};")
     conn.row_factory = sqlite3.Row
     return conn
 
